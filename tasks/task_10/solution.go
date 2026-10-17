@@ -1,10 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,18 +19,22 @@ type Task struct {
 	Done      bool      `json:"done"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
+
 type TaskRepo interface {
 	Create(title string) (Task, error)
 	Get(id string) (Task, bool)
 	List(done bool) []Task
 	SetDone(id string, done bool) (Task, error)
 }
+
 type Clock interface{ Now() time.Time }
 
 var (
 	ErrNotFound     = errors.New("task not found")
 	ErrInvalidTitle = errors.New("invalid title")
 )
+
+var taskSequence atomic.Uint64
 
 type inMemoryTaskRepo struct {
 	mu    sync.RWMutex
@@ -35,44 +44,227 @@ type inMemoryTaskRepo struct {
 }
 
 func NewInMemoryTaskRepo(clock Clock) TaskRepo {
-	panic("TODO: implement")
+	return &inMemoryTaskRepo{
+		clock: clock,
+		tasks: make(map[string]Task),
+	}
 }
+
 func (r *inMemoryTaskRepo) Create(title string) (Task, error) {
-	panic("TODO: implement")
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return Task{}, ErrInvalidTitle
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.seq = taskSequence.Add(1)
+	task := Task{
+		ID:        strconv.FormatUint(r.seq, 10),
+		Title:     title,
+		UpdatedAt: r.clock.Now(),
+	}
+	r.tasks[task.ID] = task
+
+	return task, nil
 }
+
 func (r *inMemoryTaskRepo) Get(id string) (Task, bool) {
-	panic("TODO: implement")
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	task, exists := r.tasks[id]
+	return task, exists
 }
+
 func (r *inMemoryTaskRepo) List(done bool) []Task {
-	panic("TODO: implement")
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	tasks := make([]Task, 0, len(r.tasks))
+	for _, task := range r.tasks {
+		if task.Done != done {
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+
+	return tasks
 }
+
 func (r *inMemoryTaskRepo) SetDone(id string, done bool) (Task, error) {
-	panic("TODO: implement")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	task, exists := r.tasks[id]
+	if !exists {
+		return Task{}, ErrNotFound
+	}
+	if task.Done == done {
+		return task, nil
+	}
+
+	task.Done = done
+	task.UpdatedAt = r.clock.Now()
+	r.tasks[id] = task
+
+	return task, nil
 }
 
 type httpHandler struct{ repo TaskRepo }
 
 func NewHTTPHandler(repo TaskRepo) http.Handler {
-	panic("TODO: implement")
+	return &httpHandler{repo: repo}
 }
+
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	if r.URL.Path == "/tasks" {
+		switch r.Method {
+		case http.MethodPost:
+			h.handleCreate(w, r)
+		case http.MethodGet:
+			h.handleList(w, r)
+		default:
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	if !strings.HasPrefix(r.URL.Path, "/tasks/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/tasks/")
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		h.handleGet(w, r, id)
+	case http.MethodPatch:
+		h.handlePatch(w, r, id)
+	default:
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+	}
 }
+
 func (h *httpHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	var request struct {
+		Title *string `json:"title"`
+	}
+
+	err := decodeStrictJSON(r.Body, &request)
+	if err != nil || request.Title == nil {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	task, err := h.repo.Create(*request.Title)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrInvalidTitle) {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, task)
 }
+
 func (h *httpHandler) handleGet(w http.ResponseWriter, r *http.Request, id string) {
-	panic("TODO: implement")
+	task, exists := h.repo.Get(id)
+	if !exists {
+		http.NotFound(w, r)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, task)
 }
+
 func (h *httpHandler) handleList(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: implement")
+	done := false
+	values, exists := r.URL.Query()["done"]
+	if exists {
+		if len(values) != 1 || (values[0] != "true" && values[0] != "false") {
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		done = values[0] == "true"
+	}
+
+	tasks := h.repo.List(done)
+	if tasks == nil {
+		tasks = []Task{}
+	}
+
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].UpdatedAt.Equal(tasks[j].UpdatedAt) {
+			return tasks[i].ID < tasks[j].ID
+		}
+		return tasks[i].UpdatedAt.After(tasks[j].UpdatedAt)
+	})
+
+	writeJSON(w, http.StatusOK, tasks)
 }
+
 func (h *httpHandler) handlePatch(w http.ResponseWriter, r *http.Request, id string) {
-	panic("TODO: implement")
+	var request struct {
+		Done *bool `json:"done"`
+	}
+
+	err := decodeStrictJSON(r.Body, &request)
+	if err != nil || request.Done == nil {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	task, err := h.repo.SetDone(id, *request.Done)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, task)
 }
+
 func decodeStrictJSON(r io.Reader, v any) error {
-	panic("TODO: implement")
+	decoder := json.NewDecoder(r)
+	decoder.DisallowUnknownFields()
+
+	err := decoder.Decode(v)
+	if err != nil {
+		return err
+	}
+
+	var extra any
+	err = decoder.Decode(&extra)
+	if err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	return errors.New("expected a single JSON object")
 }
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	panic("TODO: implement")
+	data, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(data)
 }
